@@ -5,7 +5,10 @@ import os
 import re
 from dotenv import load_dotenv
 import tiktoken
-import fitz  # PyMuPDF - más rápido que PdfReader
+import fitz
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # --- Carga la API KEY ---
 api_key = None
@@ -21,10 +24,11 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
-# --- Configuración Avanzada ---
-MAX_CONTEXT_TOKENS = 100000
-MAX_PDF_PAGES = 50  # Límite de páginas por PDF
-CHUNK_SIZE = 1500   # Tamaño de fragmentos para análisis
+# --- Configuración Optimizada ---
+MAX_CONTEXT_TOKENS = 15000  # Reducido drásticamente
+MAX_PDF_PAGES = 30          # Menos páginas por PDF
+CHUNK_SIZE = 800            # Chunks más pequeños
+MAX_CHUNKS = 8              # Máximo de chunks a enviar
 
 # --- Codificador para contar tokens ---
 encoder = tiktoken.encoding_for_model("gpt-4o")
@@ -50,7 +54,7 @@ def validar_estudiante(codigo):
         st.error(f"❌ Error de validación: {str(e)}")
         return False, None
 
-# --- Carga Inteligente de PDFs (más rápida) ---
+# --- Carga Inteligente de PDFs (optimizada) ---
 def cargar_documentos():
     try:
         documentos = []
@@ -65,7 +69,7 @@ def cargar_documentos():
                 doc = fitz.open(archivo)
                 texto = ""
                 
-                # Limitar páginas y extraer texto (PyMuPDF es más rápido)
+                # Limitar páginas y extraer texto
                 for i in range(min(len(doc), MAX_PDF_PAGES)):
                     texto += doc.get_page_text(i)
                 
@@ -81,55 +85,69 @@ def cargar_documentos():
         st.error(f"🚨 Error crítico: {str(e)}")
         return []
 
-# --- Construcción de Contexto con Razonamiento Mejorado ---
-def construir_contexto(documentos, pregunta):
+# --- Selección de chunks relevantes usando TF-IDF ---
+def seleccionar_chunks_relevantes(documentos, pregunta):
     if not documentos:
         return ""
     
-    # 1. Preparar chunks semánticos
+    # Preparar chunks semánticos
     chunks = []
     for nombre, texto in documentos:
         words = texto.split()
         for i in range(0, len(words), CHUNK_SIZE):
             chunk = " ".join(words[i:i+CHUNK_SIZE])
-            chunks.append(f"[DOC: {nombre}]\n{chunk}\n---")
+            chunks.append((chunk, nombre))
     
-    # 2. Seleccionar chunks relevantes a la pregunta
-    tokens_disponibles = MAX_CONTEXT_TOKENS - len(encoder.encode(pregunta)) - 500
+    # Si no hay suficientes chunks, devolverlos todos
+    if len(chunks) <= MAX_CHUNKS:
+        return chunks
+    
+    # Calcular similitud con TF-IDF
+    textos = [pregunta] + [chunk for chunk, _ in chunks]
+    vectorizer = TfidfVectorizer().fit_transform(textos)
+    similitudes = cosine_similarity(vectorizer[0:1], vectorizer[1:]).flatten()
+    
+    # Obtener los índices de los chunks más relevantes
+    indices_relevantes = np.argsort(similitudes)[::-1][:MAX_CHUNKS]
+    
+    # Devolver solo los chunks más relevantes
+    return [chunks[i] for i in indices_relevantes]
+
+# --- Construcción de Contexto Optimizada ---
+def construir_contexto(documentos, pregunta):
+    if not documentos:
+        return ""
+    
+    # Seleccionar solo chunks relevantes
+    chunks_relevantes = seleccionar_chunks_relevantes(documentos, pregunta)
+    
+    # Construir contexto con chunks seleccionados
     contexto = ""
+    tokens_pregunta = len(encoder.encode(pregunta))
+    tokens_disponibles = MAX_CONTEXT_TOKENS - tokens_pregunta - 500
     
-    for chunk in chunks:
-        chunk_tokens = len(encoder.encode(chunk))
+    for chunk, nombre in chunks_relevantes:
+        chunk_text = f"[DOC: {nombre}]\n{chunk}\n---\n\n"
+        chunk_tokens = len(encoder.encode(chunk_text))
+        
         if tokens_disponibles - chunk_tokens > 0:
-            contexto += chunk + "\n\n"
+            contexto += chunk_text
             tokens_disponibles -= chunk_tokens
-        else:
-            break
     
-    # 3. Instrucciones de razonamiento mejoradas
+    # Prompt optimizado para reducir tokens
     sistema = f"""
-Eres un profesor experto en Ingeniería de Sistemas con acceso a documentos académicos. Sigue estrictamente estas reglas:
+Eres un profesor experto en Ingeniería de Sistemas. Reglas:
 
-1. EVALUAR la pregunta: "{pregunta}"
-   - Si NO está relacionada con Sistemas de Información, Ingeniería de Software, TI o temas técnicos relacionados:
-        → Respuesta EXACTA: "Disculpa, solo puedo contestar cosas sobre ingeniería de sistemas o temas relacionados."
+1. Si la pregunta NO es sobre: Sistemas, Software, TI o temas técnicos → 
+   Respuesta EXACTA: "Disculpa, solo puedo contestar sobre ingeniería de sistemas"
 
-2. PARA PREGUNTAS VÁLIDAS:
-   a) Identificar 3-5 conceptos clave de la pregunta
-   b) Buscar estos conceptos en los fragmentos documentales
-   c) Analizar conexiones entre conceptos
-   d) Sintetizar información relevante
+2. Para preguntas válidas:
+   - Analiza fragmentos relevantes
+   - Responde conciso (1-3 oraciones)
+   - Cita documento: [Nombre.pdf]
+   - Sin información: "🔍 No encontré información específica"
 
-3. ESTRUCTURA DE RESPUESTA:
-   - Máximo 3 oraciones concisas
-   - Incluir referencia exacta al documento: [Nombre.pdf]
-   - Explicar el razonamiento en 1 oración si es complejo
-   - Usar analogías técnicas cuando sea útil
-
-4. SI NO HAY INFORMACIÓN:
-   "🔍 No encontré información específica en los materiales sobre este tema"
-
-Fragmentos documentales disponibles:
+Fragmentos:
 {contexto}
 """
     return sistema
@@ -319,18 +337,22 @@ def main():
                         *st.session_state.messages[-3:]  # Mantener contexto reciente
                     ]
                     
-                    # Llamada a la API
+                    # Llamada a la API con límites ajustados
                     response = client.chat.completions.create(
                         model="gpt-4o",
                         messages=messages,
-                        temperature=0.3,
-                        max_tokens=1500,
-                        top_p=0.7
+                        temperature=0.2,
+                        max_tokens=800,   # Reducido de 1500 a 800
+                        top_p=0.8
                     )
                     
                     respuesta = response.choices[0].message.content
                 except Exception as e:
-                    respuesta = f"⚠️ Error: {str(e)}"
+                    # Manejo específico de error 429
+                    if "429" in str(e):
+                        respuesta = "⚠️ Límite de uso excedido. Por favor espera un minuto antes de hacer otra pregunta."
+                    else:
+                        respuesta = f"⚠️ Error: {str(e)}"
             
             st.session_state.messages.append({"role": "assistant", "content": respuesta})
             
